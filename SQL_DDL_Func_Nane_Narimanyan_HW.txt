@@ -1,0 +1,126 @@
+TASK 6: 
+Nane Narimanyan 
+
+This analysis describes the standard PostgreSQL DVD Rental function logic. DVD Rental versions differ. Function names alone do not prove that the installed definitions implement the same logic. The SQL inspection queries at the end must be run on the submitted dvdrental database; any difference must be reconciled before claiming these answers describe the actual code.
+
+1. BUSINESS OPERATIONS PERFORMED BY THE FUNCTIONS
+
+film_in_stock(film_id, store_id): Finds inventory copies of a particular film in a particular store that can currently be rented. In the conventional implementation, it filters inventory by film_id and store_id, then calls inventory_in_stock(inventory_id). It returns inventory IDs (often with an OUT parameter). Business purpose: find rentable copies, not merely whether a film exists in the catalog.
+
+film_not_in_stock(film_id, store_id): Finds copies at the specified store that are not available, typically using NOT inventory_in_stock(inventory_id). Its logic is the complement of film_in_stock for the same inventory set, assuming the helper returns non-NULL booleans.
+
+inventory_in_stock(inventory_id): Tests whether an individual copy is available. Typical logic: if no rental exists for that inventory item, it is in stock; otherwise it is in stock only when no rental for that copy has return_date IS NULL. A NULL return_date represents an unreturned rental. This is an availability decision, not an inventory-count calculation.
+
+get_customer_balance(customer_id, effective_date): Calculates a customer's balance as of a given date. In the usual sample, it sums rental charges (base rental fee plus any late fees) and subtracts payments received by the effective date. The precise treatment of returned versus unreturned rentals, late fees, and date cutoffs must be read from the installed function before reporting a numeric example.
+
+inventory_held_by_customer(inventory_id): Looks for an unreturned rental of the given copy and returns its customer_id, or NULL if no current holder is found. This answers who currently has the physical item, not who last rented it.
+
+rewards_report(min_monthly_purchases, min_dollar_amount_purchased): Identifies customers meeting both a minimum count of purchases and a minimum total amount spent in the reporting period. The conventional DVD Rental function uses a prior-calendar-month window and returns matching customer records. Both thresholds are applied to each customer's payments in that period.
+
+last_day(timestamp): Calculates the last calendar day of the input timestamp's month. It is commonly used to construct reporting-period boundaries.
+
+2. WHY rewards_report MAY RETURN ZERO ROWS; CORRECTION
+
+The function may be logically correct yet return zero rows because (a) no payments fall within its reporting month, (b) no customer meets both thresholds, or (c) the month boundary or aggregation predicates exclude relevant rows. DVD Rental sample payment data are often historical, whereas a relative previous-month filter uses today's date. Confirm by comparing the actual function's computed month with MIN(payment_date) and MAX(payment_date) from public.payment.
+
+A useful improvement is to allow an explicit reporting month rather than relying exclusively on the system date. For example, a replacement reporting query can use:
+
+  WHERE p.payment_date >= p_month_start
+    AND p.payment_date < p_month_start + INTERVAL '1 month'
+  GROUP BY p.customer_id
+  HAVING COUNT(*) >= p_min_purchases
+     AND SUM(p.amount) >= p_min_amount
+
+This uses a half-open time interval, avoiding the common error of omitting payments on the month's final day. It also makes historical test data usable. If the business requirement is specifically 'last calendar month', the existing relative-month behavior should be retained; the correct fix is to use suitable data and thresholds, not silently change its meaning. If the installed function uses temporary tables, a single grouped SELECT/RETURN QUERY can often replace them, reducing side effects and complexity. Do not overwrite the existing function until its return type and consumers are checked.
+
+3. FUNCTIONS THAT MIGHT BE REDUNDANT OR UNNECESSARY
+
+film_in_stock and film_not_in_stock express opposite predicates over the same film/store inventory; one parameterized availability query could support both. However, retaining the two named functions can improve clarity for callers. last_day can be replaced with an expression such as (date_trunc('month', ts) + INTERVAL '1 month' - INTERVAL '1 day')::date, but a helper may be useful. An old custom group_concat implementation may be replaceable by PostgreSQL string_agg(... ORDER BY ...). These are refactoring candidates, not proof that a function should be deleted. Check callers, dependencies and signatures before dropping anything.
+
+4. BEST-PRACTICE CONCERNS TO CHECK IN THE INSTALLED CODE
+
+rewards_report: a fixed relative reporting period limits reusability for historical reports; temporary tables or DDL inside a reporting function may be unnecessary; threshold validation should reject negative or NULL thresholds if those inputs are invalid under the business rules.
+
+get_customer_balance: repeated correlated subqueries may do unnecessary work; unclear late-fee policy, date boundaries or NULL return_date handling may lead to inconsistent balances. Charges and payments should be calculated with explicit cutoffs and clear rules.
+
+film_in_stock / film_not_in_stock: procedural row-by-row evaluation can be less efficient than a set-based NOT EXISTS query on unreturned rentals; the best choice depends on actual plans and indexes.
+
+group_concat / group_concat1: concatenation without explicit ordering produces unstable output order; an aggregate that does not handle NULL values carefully can return surprising results.
+
+last_updated: appropriate as a BEFORE UPDATE trigger, but it should not be declared IMMUTABLE and must update the intended timestamp column consistently. These are review criteria, not verified violations without seeing pg_get_functiondef.
+
+5. get_customer_balance: IMPLEMENTATION AND CHANGING BUSINESS RULES
+
+The normal business formula is:
+  customer_balance = accrued_rental_charges + late_fees - payments_received.
+
+A typical implementation derives charges by joining rental to inventory and film, uses film.rental_rate for the base charge, determines lateness from rental_duration and elapsed rental time, and subtracts payments in payment up to the effective date. The exact number of charge days, rate of late fees, and whether overdue-but-unreturned rentals are included depend on the installed SQL. For new requirements, first define the rules (e.g. $2 per late day, maximum penalty, grace period, refunds, effective-date inclusivity), then change the charge/fee expressions and add tests for an on-time rental, one-day-late rental, an unreturned rental, no payments, and a payment exactly on the cutoff. Use COALESCE for empty sums and avoid multiplying rental charges through accidental one-to-many joins.
+
+6. group_concat AND group_concat1: IMPLEMENTATION AND USAGE
+
+In common DVD Rental distributions, group_concat is an aggregate helper for concatenating values; group_concat1 may be an internal transition function or a related helper. Their precise roles are not universal. Inspect pg_proc and pg_aggregate to see which is a function, which is an aggregate, the transition state and delimiter behavior. Then inspect pg_get_functiondef and database references to locate call sites. The standard modern PostgreSQL alternative is string_agg(value::text, ', ' ORDER BY value::text), which provides explicit ordering. Do not claim the functions are interchangeable without verifying NULL handling, signatures and separators.
+
+7. last_updated: PURPOSE AND WHERE IT IS USED
+
+The conventional last_updated trigger function sets NEW.last_update = CURRENT_TIMESTAMP before an UPDATE, then returns NEW. It keeps a row's update timestamp synchronized with changes without requiring every application query to set it manually. Its actual use is determined by triggers, not by the function name: query pg_trigger and pg_get_triggerdef to list the attached tables. A trigger function is invoked by a trigger and normally cannot be called as an ordinary SELECT-returning function.
+
+8. mstSQL VARIABLE AND DYNAMIC SQL
+
+mstSQL is not a PostgreSQL keyword. If this variable appears in the installed function source, it is a user-defined text variable containing an SQL statement that is executed dynamically with EXECUTE mstSQL. Dynamic SQL is needed when statement structure (e.g. table or column identifiers) varies at runtime; it is unnecessary when only parameter values change. Prefer EXECUTE format('SELECT ... FROM %I WHERE key = $1', table_name) USING key_value to quote identifiers safely and bind data values. Plain concatenation of untrusted input risks SQL injection and quoting bugs. Confirm the exact variable name and use by searching the installed definitions.
+
+9. FUNCTIONS THAT CAN RETURN INCORRECT OR MISLEADING RESULTS
+
+get_customer_balance: a balance may be wrong if late fees are assessed using an incorrect cutoff, payments after the effective date are included, or NULL/unreturned rentals are mishandled.
+
+inventory_in_stock / inventory_held_by_customer: inconsistent data with multiple simultaneous unreturned rentals for one copy can cause misleading availability/holder results. A scalar SELECT INTO without deterministic ordering may pick an arbitrary row.
+
+rewards_report: the result may appear wrong if a prior-month window is used when the user expects a selected month, or if COUNT(*) counts payment rows when the business definition of 'purchases' means rentals/orders.
+
+film_in_stock / film_not_in_stock: duplicate inventory rows or incorrect join predicates can produce unexpected results; verify against inventory/rental records for a specific copy.
+
+group_concat: concatenation order can change between executions without an ORDER BY; NULL handling and delimiter choice may not meet reporting expectations.
+
+These are potential failure modes. A verified defect requires comparing actual source and test results with the stated business rule.
+
+VERIFICATION QUERIES — RUN IN pgAdmin AGAINST YOUR dvdrental DATABASE
+
+-- A. Exact installed function source and signatures:
+SELECT n.nspname AS schema_name, p.proname AS function_name,
+       pg_get_function_identity_arguments(p.oid) AS arguments,
+       pg_get_functiondef(p.oid) AS definition
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE p.prokind = 'f' AND p.proname IN
+ ('film_in_stock','film_not_in_stock','inventory_in_stock',
+  'get_customer_balance','inventory_held_by_customer',
+  'rewards_report','last_day','group_concat','group_concat1','last_updated')
+ORDER BY p.proname, arguments;
+
+-- B. Installed aggregates and their transition functions:
+SELECT n.nspname AS schema_name, p.proname AS aggregate_name,
+       pg_get_function_identity_arguments(p.oid) AS arguments,
+       a.aggtransfn::regprocedure AS transition_function
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_aggregate a ON a.aggfnoid = p.oid
+WHERE p.proname IN ('group_concat','group_concat1');
+
+-- C. Tables with triggers using last_updated:
+SELECT n.nspname AS schema_name, c.relname AS table_name,
+       t.tgname AS trigger_name, pg_get_triggerdef(t.oid) AS trigger_definition
+FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE NOT t.tgisinternal
+  AND t.tgfoid IN (SELECT oid FROM pg_proc WHERE proname = 'last_updated')
+ORDER BY schema_name, table_name;
+
+-- D. Payment date coverage:
+SELECT MIN(payment_date) AS first_payment,
+       MAX(payment_date) AS last_payment, COUNT(*) AS payment_count
+FROM public.payment;
+
+-- E. Functions containing a reference to mstSQL or group_concat:
+SELECT n.nspname AS schema_name, p.proname AS function_name
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE p.prokind = 'f'
+  AND (p.prosrc ILIKE '%mstSQL%' OR p.prosrc ILIKE '%group_concat%');
+
+
